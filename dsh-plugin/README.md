@@ -574,7 +574,8 @@ npm run panel:check                    # 上面两个一起跑
 
 | 症状 | 根因 | 修法 / 回归 |
 |---|---|---|
-| 浏览器登录账号看不到「夜间免费」等活动名，桌面登录同账号可见 | 插件来源的 `/v3/config` 用插件/CLI 身份，能拿到更全模型但不返回 `modelPromotions`；促销只认桌面身份 | 插件来源额外用桌面身份抓一份 `/v3/config`，**只合并 `modelPromotions`**，模型清单仍用插件身份（不丢 v2 独有模型）；诊断看 `upstreamShape.sources['/v3/config#desktopPromotions']`。回归：`bridge.test.mjs` 的插件登录用例 |
+| 浏览器登录账号看不到「夜间免费」等活动名，桌面登录同账号可见 | 插件来源的 `/v3/config` 用插件/CLI 身份，能拿到更全模型但不返回 `modelPromotions`；促销只认桌面身份 | 插件来源额外用桌面身份抓一份 `/v3/config`，合并 `modelPromotions` 与模型清单（只增不减，不丢插件身份独有模型）；诊断看 `upstreamShape.sources['/v3/config#VSCode#modelPromotions']`。回归：`bridge.test.mjs` 的插件登录用例 |
+| 某个官方模型在 dsh 里搜不到（如 `deepseek-v4.1-flash-sg`） | 上游按 `X-IDE-Name` 返回**互不相同**的模型目录（`VSCode` 28 个 / `WorkBuddy` 32 个，交集仅 20 个，谁也不是谁的超集）；只发一个身份必然漏掉另一半。**与账号等级、版本号无关** | 桥对另一个产品身份额外抓一份 `/v3/config` 求并集（`WORKBUDDY_CATALOG_IDENTITY_UNION`，默认开），桌面来源目录 28 → 40；诊断看 `upstreamShape.sources['/v3/config#WorkBuddy']` 与 `identityUnion`。回归：`bridge.test.mjs` 的「目录双身份并集」用例 |
 | Cherry Studio 每个字符一条「深度思考」 | 上游每帧带空 `tool_calls: []`，Cherry 的解析器把 `tool_calls != null` 当成 reasoning 段结束 | chat SSE 归一先剔掉空 `tool_calls` / 空 content / null 占位，再聚合逐字符 reasoning；`WORKBUDDY_SSE_NORMALIZE=0` 可回退。回归：`bridge.test.mjs` 的 SSE 夹具 |
 | 升级/重装后账号钉住、用量与本地令牌丢失，旧客户端 401 | state / usage / token 在安装目录内，pnpm 换 tgz 会整个换掉 | 默认迁到 `%USERPROFILE%\.workbuddy-bridge\`（`WORKBUDDY_DATA_DIR` 可覆盖），旧路径首次启动复制迁移；插件与桥读同一份。回归：`state.test.mjs`、插件登录用例、`verify:standalone` |
 

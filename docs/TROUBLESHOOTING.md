@@ -332,16 +332,46 @@ WORKBUDDY_IDE_NAME=VSCode
 2026-10-26 只读 A/B 定位：浏览器登录（插件来源）的目录请求默认用插件/CLI 身份，
 `/v3/config` 能拿到更全的模型（含只在 v2 目录里的 13 个），但**不返回
 `modelPromotions`**；桌面身份才返回。桥现在在插件来源下**额外用桌面身份抓一份
-`/v3/config`，只合并 `modelPromotions`**，模型清单仍用插件身份那份。
+`/v3/config`**，合并模型与 `modelPromotions`。
 
 若仍看不到：
 
 1. 看 `GET /health` 的 `upstreamShape.sources` 里有没有
-   `/v3/config#desktopPromotions`；`0` 表示桌面身份这次也没返回活动。
+   `/v3/config#VSCode#modelPromotions`；`0` 表示桌面身份这次也没返回活动。
 2. 「夜间免费」是活动名，白天也会显示；**是否真的免费**看返回里的
    `promotion_active` / `credits === 0`，不要只看徽章。
 3. 不要为了促销设 `WORKBUDDY_PLUGIN_IDENTITY=vscode` —— 那会拿回促销，但会丢掉
-   v2 目录独有的模型，不是最终修法。
+   v2 目录独有的模型，不是最终修法（现在促销已由双身份并集自动补齐）。
+
+### dsh 里搜不到某个官方模型（例如 `deepseek-v4.1-flash-sg`）
+
+**根因是出站产品身份，不是账号等级、也不是版本号。** 上游按 `X-IDE-Name` 决定
+返回哪一份模型目录，而两份目录**互有独有项**（2026-11-02 同账号只读 A/B，
+两次唯一的差别就是产品名）：
+
+| 身份 | 模型数 | 独有模型 |
+| --- | --- | --- |
+| `VSCode` | 28 | `claude-opus-4.8`、`claude-haiku-4.5`/`5.5`、`auto-chat`、`nes-1.1`/`1.2`、`enhance-1.0`、`seedance-2.5` |
+| `WorkBuddy` | 32 | `deepseek-v4.1-flash-sg`、`gpt-6-astra`/`sol`/`6.1-sol`、`grok-4.7`、`kimi-k3.1-pro`（含 highspeed）、`glm-5.3-flash`、`gemini-3.8-flash`、`minimax-m3.1-flash`、`hy-image-3.5`、`kling-video-v3` |
+
+两者交集只有 20 个，**谁也不是谁的超集** —— 所以桥默认**两个身份各抓一份
+`/v3/config` 求并集**（只增不减：已存在的 id 保留主身份字段），桌面来源下就能
+直接看到全部 40 个模型，不用手改 `.env`。
+
+版本号**不影响**目录：实测 `5.9.4` 配 `VSCode` 仍然只有 28 个。唯一决定因素是
+产品名。因此「改版本号把模型改出来」这条路是错的。
+
+排查顺序：
+
+1. `GET /health` 看 `upstreamShape.sources` 里有没有 `/v3/config#WorkBuddy`
+   （`"24 (+12)"` 表示这次从另一个身份补进来 12 个）和
+   `upstreamShape.identityUnion`（应为 `["WorkBuddy"]`）。
+2. 并进来的模型必须 `official: true` 才会出现在 dsh 默认选择器里 —— 桥会把补抓
+   身份的 agents/models 一起算进官方判定。若面板里看得到、dsh 里没有，检查
+   `dsh-plugin` 那边的可见性偏好（`~/.dsh/workbuddy-model-prefs.json`）。
+3. 极端情况下想退回单身份老行为：`WORKBUDDY_CATALOG_IDENTITY_UNION=0`。
+4. 若某个模型**在目录里但仍调不通**，那是账号未开通该线路（上游 400
+   `11102 service info not found`）或该模型被限流（429 `6004`），与目录无关。
 
 ### Cherry Studio 每个字符一条「深度思考」（issue #9）
 

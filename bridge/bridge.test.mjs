@@ -6497,3 +6497,111 @@ test('冷目录负缓存：上游目录持续失败时，连发请求不重复�
     await new Promise((r) => upstream.close(r));
   }
 });
+
+test('目录双身份并集：桌面身份漏列的模型必须由另一个产品身份补进来（deepseek-v4.1-flash-sg）', { timeout: 90_000 }, async () => {
+  /*
+   * 现场（2026-11-02，同账号只读 A/B，两次唯一差别就是出站 `X-IDE-Name`）：
+   *   - `VSCode` 身份：28 个模型，**没有** deepseek-v4.1-flash-sg；
+   *   - `WorkBuddy` 身份：32 个模型，有 -sg（official:true，credits 0.03）。
+   * 两份目录**互有独有项**（VSCode 独有 claude-opus-4.8 / nes-1.x 等 8 个，
+   * WorkBuddy 独有 -sg / gpt-6-sol / grok-4.7 等 12 个），谁也不是谁的超集。
+   *
+   * 只发一个身份就必然漏模型，用户表现为「dsh 里搜不到 -sg」，只能手改
+   * `.env` 的 WORKBUDDY_IDE_NAME —— 但那又会丢掉另一个身份的模型。
+   * 所以桥必须**两个身份都发一份 /v3/config，把模型清单求并集**。
+   *
+   * 这里钉住四件事：
+   *   ① 补抓身份独有的模型要进目录，且 `official: true`（否则 dsh 默认隐藏）；
+   *   ② 主身份独有的模型**不能**被挤掉（并集，不是替换）；
+   *   ③ 主身份已有条目的字段不被补抓身份覆盖；
+   *   ④ 补抓失败只影响诊断，目录主链路照常。
+   */
+  const configHits = [];
+  const upstream = createServer((req, res) => {
+    const path = new URL(req.url, 'http://127.0.0.1').pathname;
+    const send = (status, obj) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    if (path === '/v2/enterprises/personal/models') {
+      return send(200, { code: 0, data: { models: [] } });
+    }
+    if (path === '/v3/config') {
+      const ua = String(req.headers['user-agent'] || '');
+      configHits.push(ua);
+      const isWorkBuddy = /^WorkBuddy\//i.test(ua);
+      if (!isWorkBuddy) {
+        // 桌面 IDE 身份：28 个那份的缩影，**没有** -sg，且自带 vscode-only 模型
+        return send(200, {
+          code: 0,
+          data: {
+            agents: [{ name: 'cli', tags: ['default'], models: [{ id: 'vscode-only-model' }, { id: 'shared-model' }] }],
+            models: [
+              { id: 'shared-model', maxInputTokens: 128000, maxOutputTokens: 8192, credits: 0.11 },
+              { id: 'vscode-only-model', maxInputTokens: 200000, maxOutputTokens: 64000 },
+            ],
+          },
+        });
+      }
+      // WorkBuddy 产品身份：有 -sg，**没有** vscode-only-model
+      return send(200, {
+        code: 0,
+        data: {
+          agents: [{ name: 'cli', tags: ['default'], models: [{ id: 'deepseek-v4.1-flash-sg' }, { id: 'shared-model' }] }],
+          models: [
+            { id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', maxInputTokens: 300000, maxOutputTokens: 128000, credits: 0.03 },
+            // 同名条目：字段更"差"，用来验证主身份优先、补抓不覆盖
+            { id: 'shared-model', maxInputTokens: 1000, maxOutputTokens: 1000, credits: 9.99 },
+          ],
+        },
+      });
+    }
+    return send(404, {});
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  const upstreamBase = `http://127.0.0.1:${upstream.address().port}`;
+
+  const bridge = await startBridge({
+    CODEBUDDY_ENDPOINT: upstreamBase,
+    WORKBUDDY_SKIP_MODEL_PREFLIGHT: '1',
+  }, { auth: READABLE_FAKE_AUTH });
+  try {
+    const catalog = await (await fetch(`${bridge.baseUrl}/v1/models?all=1&refresh=1`, {
+      headers: auth,
+      signal: AbortSignal.timeout(60_000),
+    })).json();
+    const byId = new Map(catalog.data.map((m) => [m.id, m]));
+
+    // ① 补抓身份独有的模型必须进目录，且算官方
+    assert.ok(byId.has('deepseek-v4.1-flash-sg'),
+      '补抓身份独有的 -sg 必须进目录，否则用户永远搜不到');
+    assert.equal(byId.get('deepseek-v4.1-flash-sg').official, true,
+      '并进来的模型必须标 official，否则 dsh 默认选择器会隐藏它');
+    assert.equal(byId.get('deepseek-v4.1-flash-sg').credits, 0.03,
+      '并进来的模型必须带上游给的倍率');
+
+    // ② 主身份独有的模型不能被挤掉（并集不是替换）
+    assert.ok(byId.has('vscode-only-model'),
+      '主身份独有的模型必须保留 —— 换成单身份会丢掉这 8 个');
+
+    // ③ 两边都有的条目：以主身份为准，补抓不得覆盖
+    assert.equal(byId.get('shared-model').context_window, 128000,
+      '同 id 条目必须保留主身份的字段，不能被补抓身份覆盖');
+    assert.equal(byId.get('shared-model').credits, 0.11,
+      '同 id 条目的倍率也必须保留主身份的值');
+
+    // ④ 两个身份都真的发过请求
+    assert.ok(configHits.length >= 2,
+      `必须向两个身份各发一次 /v3/config，实际 ${configHits.length} 次`);
+    assert.ok(configHits.some((ua) => /^WorkBuddy\//i.test(ua)), '必须有一次 WorkBuddy 产品身份的补抓');
+
+    // ⑤ 诊断要能看出并集来自哪个身份
+    const health = await (await fetch(`${bridge.baseUrl}/health`, { headers: auth })).json();
+    const shape = health.upstreamShape || {};
+    assert.deepEqual(shape.identityUnion, ['WorkBuddy'],
+      `诊断应记录并集身份，实际：${JSON.stringify(shape.identityUnion)}`);
+  } finally {
+    await bridge.stop();
+    await new Promise((r) => upstream.close(r));
+  }
+});

@@ -107,6 +107,7 @@ copy .env.example .env
 | `WORKBUDDY_CREDENTIAL_FAILOVER` | `same-account` | 鉴权失败（401/403）时另一条凭据是否接管：`same-account` = 只在桌面端与插件端 **uid 相同**时接管（钱包不变）；`any` = 任意账号接管（会切换账号/钱包，显式 opt-in）；`off` = 不接管 |
 | `WORKBUDDY_PLUGIN_IDENTITY` | `workbuddy` | 插件来源的 chat 身份：`workbuddy`（WorkBuddy 形状 UA / `X-IDE-*` / Origin，参考实现实测）/ `vscode`（退回旧头）。桌面来源不受影响 |
 | `WORKBUDDY_PLUGIN_APP_VERSION_CN` / `_GLOBAL` | `5.5.6` / `5.5.2` | 插件身份声明的桌面版本（进 UA 与 `X-IDE-Version`）；非法值自动回退 |
+| `WORKBUDDY_CATALOG_IDENTITY_UNION` | `1`（开） | 目录「双身份并集」。上游按 `X-IDE-Name` 返回**互不相同**的模型目录（`VSCode` 28 个 / `WorkBuddy` 32 个，交集仅 20 个，谁也不是谁的超集），桥额外用另一个产品身份抓一份 `/v3/config`，把漏掉的模型补进目录（**只增不减**：已存在的 id 保留主身份字段）。桌面来源因此也能看到 `deepseek-v4.1-flash-sg` 等 12 个客户端独有模型，无需手改 `WORKBUDDY_IDE_NAME`。置 `0` 退回单身份老行为（会漏模型，仅排查时用） |
 
 > 未用环境变量锁定来源时，面板/控制台里的选择会持久化到 `source.json`；登录成功后
 > 自动切到 `plugin` 并在界面明示，可随时切回 `desktop` / `auto`。

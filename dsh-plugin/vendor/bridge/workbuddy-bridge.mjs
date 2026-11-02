@@ -1011,7 +1011,13 @@ function officialPickerIds(agents, models) {
     || list[0]
     || null;
   const ids = new Set();
-  if (picker) for (const id of picker.models) if (typeof id === 'string' && id) ids.add(id);
+  // `picker.models` 实测是字符串数组；也容忍 `{ id }` 形状（上游换形状时不至于
+  // 静默丢掉整个选择器清单 —— 那会让所有模型都被标成非官方）。
+  const addId = (v) => {
+    const id = typeof v === 'string' ? v : (v && typeof v.id === 'string' ? v.id : '');
+    if (id) ids.add(id);
+  };
+  if (picker) for (const id of picker.models) addId(id);
   for (const m of Array.isArray(models) ? models : []) {
     if (!m || typeof m.id !== 'string' || !m.id) continue;
     if (Array.isArray(m.tags) && m.tags.includes('chat')) ids.add(m.id);
@@ -8949,6 +8955,66 @@ function catalogPathsFor() {
   return CATALOG_PATHS;
 }
 
+/**
+ * 目录「双身份并集」开关。默认开；置 0 退回单身份（老行为，会漏模型）。
+ * 关掉只应出现在排查「上游突然只认某个身份」时。
+ */
+const CATALOG_IDENTITY_UNION = !/^(0|false|off|no)$/i.test(
+  String(process.env.WORKBUDDY_CATALOG_IDENTITY_UNION || '1').trim(),
+);
+
+/**
+ * 主目录之外，**再补抓一份**要用的身份（产品名）。返回 '' 表示不补。
+ *
+ * 上游按出站 `X-IDE-Name` 决定返回哪一份模型目录，而两份目录**互有独有项**
+ * （2026-11-02 同账号只读 A/B，两次唯一的差别就是产品名）：
+ *
+ *   VSCode 身份 28 个 / WorkBuddy 身份 32 个，交集仅 20 个。
+ *   - 只有 VSCode 身份有：claude-haiku-4.5、claude-opus-4.8、auto-chat、
+ *     nes-1.1、nes-1.2、enhance-1.0、seedance-2.5
+ *   - 只有 WorkBuddy 身份有：deepseek-v4.1-flash-sg、gpt-6-astra、gpt-6-sol、
+ *     gpt-6.1-sol、grok-4.7、kimi-k3.1-pro、kimi-k3.1-pro-highspeed、
+ *     glm-5.3-flash、gemini-3.8-flash、minimax-m3.1-flash、hy-image-3.5、kling-video-v3
+ *
+ * 只发一个身份就必然漏掉另一边的模型。典型症状：**桌面登录时 dsh 里根本搜不到
+ * `deepseek-v4.1-flash-sg`**（它在 WorkBuddy 客户端里是官方模型），用户只能手改
+ * `.env` 把 `WORKBUDDY_IDE_NAME` 换成 WorkBuddy —— 但那样又会丢掉 VSCode 独有
+ * 的那 8 个，而且改 `.env` 这件事本身就不该让用户干。
+ *
+ * 版本号**不影响**目录：实测 `5.9.4` 配 `VSCode` 仍然只有 28 个。唯一决定因素
+ * 是产品名，所以这里只换名字、版本沿用当前值，不引入新的指纹风险。
+ *
+ * 插件来源保持原样（补抓桌面 VSCode 身份）：它的目录走 CLI 形状，本来就最宽，
+ * 而且 issue #10 的促销只认桌面身份，改成别的名字会把促销丢掉。
+ */
+function catalogAltIdentityName(auth) {
+  if (!CATALOG_IDENTITY_UNION) return '';
+  /*
+   * 插件来源：主目录走 WorkBuddy/CLI 身份，补抓固定用**桌面 IDE 身份**。
+   * 这里返回 IDE_NAME（默认 VSCode）—— 和主身份不同源，因为主目录走的是
+   * buildCatalogHeaders 的插件覆盖；补抓走 buildHeaders 的桌面头。
+   * 促销只认桌面身份（issue #10），所以这一份不能省。
+   * 用户若已把插件身份设成 vscode，目录本来就带促销，不用再抓。
+   */
+  if (auth.source === 'plugin') return PLUGIN_IDENTITY === 'vscode' ? '' : IDE_NAME;
+  // 桌面来源：补抓**另一个**产品身份（12 个只在客户端上架的模型）。
+  // 用户若已把 IDE_NAME 改成 WorkBuddy，就反过来补 VSCode，两头都不丢。
+  return IDE_NAME === 'WorkBuddy' ? 'VSCode' : 'WorkBuddy';
+}
+
+/**
+ * 补抓身份用的请求头：整份沿用桌面头（trace / domain / 鉴权都是实测可用的），
+ * 只把产品名相关的三项换掉。刻意不加 Origin/Referer —— 桌面来源本来就不带，
+ * 加了等于凭空多一个指纹变量。
+ */
+function buildAltIdentityHeaders(auth, altName) {
+  const h = buildHeaders(auth, '', '');
+  h['X-IDE-Type'] = altName;
+  h['X-IDE-Name'] = altName;
+  h['User-Agent'] = `${altName}/${IDE_VERSION} CodeBuddy/${APP_VERSION}`;
+  return h;
+}
+
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 /**
  * 目录抓取失败后的负缓存时长。冷目录（还没有任何缓存）时，每个 `/v1/models`
@@ -9161,6 +9227,14 @@ async function fetchCatalog(generation = catalogGeneration) {
     // `/v3/config` 是官方模型选择器的真源；单独留下 models/agents 用来标 official。
     let productModels = [];
     let productAgents = [];
+    /*
+     * 补抓身份（见 catalogAltIdentityName）返回的 models/agents。**必须**也进
+     * officialPickerIds：并进来的模型若不在官方选择器清单里，会被标成
+     * `official: false`，而插件默认只把 official 的模型放进 dsh 选择器 ——
+     * 那就等于白并了（用户还是搜不到 deepseek-v4.1-flash-sg）。
+     */
+    const altModels = [];
+    const altAgents = [];
 
     for (const path of catalogPathsFor()) {
       try {
@@ -9293,30 +9367,63 @@ async function fetchCatalog(generation = catalogGeneration) {
     }
 
     /*
-     * 浏览器登录来源的促销补抓。
+     * 目录「双身份并集」：用**另一个产品身份**再抓一份 `/v3/config`。
      *
-     * 实测（同账号只读 A/B，issue #10）：
-     *   - 桌面来源 `/v3/config`：25 个模型 + 8 条 modelPromotions；
-     *   - 插件来源（默认 WorkBuddy/CLI 身份）：34 个模型，但 **0 条促销**；
-     *   - 插件来源 + `WORKBUDDY_PLUGIN_IDENTITY=vscode`：25 个模型 + 8 条促销。
-     * 也就是说插件身份能拿到更全的模型清单（v2 独有 13 个），但拿不到促销规则；
-     * 促销只认桌面身份。不能整体切回 vscode 身份（会丢那 13 个模型），
-     * 所以这里**额外用桌面身份只抓一份 /v3/config，只合并 modelPromotions**，
-     * 模型清单仍以插件身份那份为准。
+     * 上游按出站 `X-IDE-Name` 决定返回哪份目录，而两份目录互有独有项（见
+     * catalogAltIdentityName 的实测数据）。这里把补抓到的**模型**并进目录，
+     * 顺带并进 `modelPromotions` —— 促销只认桌面身份（issue #10），
+     * 之前单独为此发过一次请求，现在合成一次，不多打上游。
      *
-     * 这是只读请求；失败只写进 shape 诊断，不影响模型目录和请求主链路。
+     * 三条硬约束：
+     *   1. **只增不减**：已存在的 id 一律保留主身份的字段（mergeCatalogModel 让
+     *      prev 优先），补抓身份只负责把漏掉的模型补进来，绝不改写现有条目。
+     *   2. **失败不致命**：只读请求，任何异常只写进 shape 诊断，不影响目录主链路。
+     *   3. **算上游**：并进来的模型来自上游真实响应，不是 FEATURED 那种凭实测
+     *      硬编的条目，所以不标 `_supplemented`，会计入 upstreamModelCount。
      */
-    if (auth.source === 'plugin' && PLUGIN_IDENTITY !== 'vscode') {
+    const altIdentity = catalogAltIdentityName(auth);
+    if (altIdentity) {
       try {
         const res = await fetch(`${auth.endpoint}/v3/config`, {
-          headers: buildHeaders(auth, '', ''),
+          headers: buildAltIdentityHeaders(auth, altIdentity),
           signal: AbortSignal.timeout(8000),
         });
         if (res.ok) {
           const body = await res.json();
-          const promos = body?.data?.modelPromotions;
+          const data = body?.data || {};
+          const altList = data?.models ?? data?.data?.models ?? data?.Data?.models;
+          const key = `/v3/config#${altIdentity}`;
+          // 模型：只在主身份没给这个 id 时新增，已有的一个字都不动。
+          let added = 0;
+          if (Array.isArray(altList)) {
+            for (const m of altList) {
+              if (!m || typeof m.id !== 'string') continue;
+              const prev = merged.get(m.id);
+              if (!prev) added += 1;
+              merged.set(m.id, mergeCatalogModel(prev, m));
+            }
+            shape.sources[key] = added ? `${altList.length} (+${added})` : altList.length;
+            if (added) {
+              shape.identityUnion = [...(shape.identityUnion || []), altIdentity];
+              log(`catalog: +${added} model(s) from ${altIdentity} identity`);
+            }
+            // 官方选择器判定要用这份 agents/models（否则并进来的模型会被标成
+            // 非官方，dsh 默认只显示 official，等于白并）。
+            if (Array.isArray(data.agents) && data.agents.length) {
+              altAgents.push(...data.agents);
+            }
+            if (altList.length) altModels.push(...altList);
+          } else {
+            shape.sources[key] = `no models (HTTP ${res.status})`;
+          }
+          /*
+           * 促销：与主身份那份做并集，同一条规则不重复。
+           * **独立于模型分支**：这一份的首要目的就是促销（只认桌面身份），
+           * 万一上游这次只回促销不回模型，也不能连促销一起丢掉。
+           */
+          const promos = data?.modelPromotions;
           if (Array.isArray(promos) && promos.length) {
-            shape.sources['/v3/config#desktopPromotions'] = promos.length;
+            shape.sources[`${key}#modelPromotions`] = promos.length;
             for (const [modelId, rules] of groupPromotions(promos)) {
               const existing = promotions.get(modelId) || [];
               const mergedRules = [...existing];
@@ -9327,15 +9434,15 @@ async function fetchCatalog(generation = catalogGeneration) {
               }
               promotions.set(modelId, mergedRules);
             }
-            log(`plugin catalog: merged ${promos.length} promotion rule(s) from desktop identity`);
+            log(`catalog: merged ${promos.length} promotion rule(s) from ${altIdentity} identity`);
           } else {
-            shape.sources['/v3/config#desktopPromotions'] = 0;
+            shape.sources[`${key}#modelPromotions`] = 0;
           }
         } else {
-          shape.sources['/v3/config#desktopPromotions'] = `HTTP ${res.status}`;
+          shape.sources[`/v3/config#${altIdentity}`] = `HTTP ${res.status}`;
         }
       } catch (e) {
-        shape.sources['/v3/config#desktopPromotions'] = `error: ${e.message}`;
+        shape.sources[`/v3/config#${altIdentity}`] = `error: ${e.message}`;
       }
     }
 
@@ -9350,8 +9457,30 @@ async function fetchCatalog(generation = catalogGeneration) {
      * `/v2/.../models` 里有些模型官方 GUI 不列（老型号 / 未开通线路），
      * 但直接调网关仍可能可用。插件默认只把 official 的放进 dsh 选择器，
      * 面板仍能看到全部并手动勾选。
+     *
+     * 补抓身份（catalogAltIdentityName）单独算一份再求并集，**不能**把 agents
+     * 数组拼起来一次算：officialPickerIds 只挑**一个** picker agent，拼接后
+     * 补抓身份那份永远选不上，它独有的模型就会被标成 official:false 并在 dsh
+     * 里隐藏 —— 目录并了等于没并。
      */
-    const officialIds = officialPickerIds(productAgents, productModels);
+    let officialIds = officialPickerIds(productAgents, productModels);
+    if (altAgents.length || altModels.length) {
+      const altOfficialIds = officialPickerIds(altAgents, altModels);
+      if (altOfficialIds) {
+        if (officialIds) {
+          for (const id of altOfficialIds) officialIds.add(id);
+        } else {
+          /*
+           * 主身份一个 official 都没算出来（例如 /v3/config 没给 agents）。
+           * 这时若还留着 null，输出层会把**所有**模型的 official 写成 null，
+           * 插件就无从判断该显示哪些 —— 并进来的模型自然也不显示。
+           * 直接采用补抓身份的选择器清单。
+           */
+          officialIds = altOfficialIds;
+          shape.officialPickerSource = 'alt';
+        }
+      }
+    }
     if (officialIds) {
       /*
        * v2 也可能单独给某个模型挂 `chat` 标签（v3 目录没列它）。官方 GUI 的
